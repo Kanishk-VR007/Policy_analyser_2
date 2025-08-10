@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+aiohttp
+pymupdf
+python-docx
+beautifulsoup4
+openai
+faiss-cpu
+sentence-transformers
+python-multipart
