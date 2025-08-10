@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+aiohttp
+pytesseract
+pytesseract
+pymupdf
+docx2txt
+beautifulsoup4
+email-to-text
+openai
+pinecone-client
+faiss-cpu
+sentence-transformers
