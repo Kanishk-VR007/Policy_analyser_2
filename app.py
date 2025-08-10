@@ -6,7 +6,7 @@ import hashlib
 import tempfile
 import logging
 from typing import List, Optional, Dict, Tuple
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 import aiohttp
 import asyncio
@@ -16,7 +16,11 @@ from bs4 import BeautifulSoup
 import email
 from email import policy as email_policy
 import openai
+from docx import Document
 
+# ... [rest of the code from analyzer.py] ...
+
+# Your original code from the first block
 # Environment Config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
@@ -59,52 +63,19 @@ FAISS_INDEXES: Dict[str, Tuple] = {}
 # FastAPI app
 app = FastAPI(title="Policy Semantic Analyzer (Pinecone + OpenAI)")
 
-
 def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-
-async def download_bytes(url: str, timeout: int = 20) -> Tuple[bytes, str]:
-    headers = {"User-Agent": "policy-analyzer/1.0"}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-        async with session.get(url, headers=headers) as resp:
-            resp.raise_for_status()
-            content = await resp.read()
-            ctype = resp.headers.get("Content-Type", "")
-            return content, ctype
-
-
-def extract_text_from_pdf_bytes(b: bytes, max_pages: int = 300) -> str:
-    texts: List[str] = []
-    try:
-        with fitz.open(stream=b, filetype="pdf") as doc:
-            n = min(len(doc), max_pages)
-            for i in range(n):
-                page = doc.load_page(i)
-                txt = page.get_text("text")
-                if txt:
-                    texts.append(txt)
-    except Exception as e:
-        logger.exception("PDF extraction failed: %s", e)
-    return "\n".join(texts)
-
-
+# ... [all other helper functions from analyzer.py] ...
+# `download_bytes`, `extract_text_from_pdf_bytes`, `extract_text_from_docx_bytes`, `extract_text_from_html_bytes`, etc.
+# Note: I've corrected the `extract_text_from_docx_bytes` to not use a tempfile, as it's not ideal for serverless or containerized environments.
 def extract_text_from_docx_bytes(b: bytes) -> str:
-    fd, path = tempfile.mkstemp(suffix=".docx")
-    os.close(fd)
-    with open(path, "wb") as f:
-        f.write(b)
     try:
-        text = docx2txt.process(path) or ""
+        doc = Document(io.BytesIO(b))
+        return "\n".join([para.text for para in doc.paragraphs])
     except Exception as e:
         logger.exception("DOCX extraction failed: %s", e)
-        text = ""
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-    return text
+        return ""
 
 
 def extract_text_from_html_bytes(b: bytes) -> str:
@@ -185,8 +156,8 @@ def chunk_text(text: str, max_chars: int = 3000) -> List[str]:
 def openai_embed_texts(texts: List[str]) -> List[List[float]]:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set")
-    resp = openai.Embedding.create(model=EMBED_MODEL, input=texts)
-    return [r["embedding"] for r in resp["data"]]
+    resp = openai.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [r.embedding for r in resp.data]
 
 
 def upsert_to_pinecone(policy_id: str, chunks: List[str], embeddings: List[List[float]]) -> None:
@@ -205,6 +176,7 @@ def build_faiss_for_policy(policy_id: str, chunks: List[str]) -> None:
         return
     emb = FAISS_MODEL.encode(chunks, convert_to_numpy=True, show_progress_bar=False)
     import faiss
+    import numpy as np
     faiss.normalize_L2(emb)
     dim = emb.shape[1]
     idx = faiss.IndexFlatIP(dim)
@@ -229,11 +201,42 @@ def load_policy_meta(policy_id: str) -> Optional[Dict]:
 class ProcessRequest(BaseModel):
     url: str
 
-
 class AskRequest(BaseModel):
     policy_id: str
     question: str
 
+
+# Your original code from main.py, refactored into the new main.py
+# Health check route for Railway
+@app.get("/")
+async def root():
+    return {"message": "Policy Analyzer is running on Railway!"}
+
+@app.post("/analyze")
+async def analyze_policy(file: UploadFile = File(...)):
+    try:
+        content = await file.read()
+        
+        # Detect file type and extract text
+        if file.filename.lower().endswith(".pdf"):
+            text = extract_text_from_pdf_bytes(content)
+        elif file.filename.lower().endswith(".docx"):
+            text = extract_text_from_docx_bytes(content)
+        elif file.filename.lower().endswith((".html", ".htm")):
+            text = extract_text_from_html_bytes(content)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file format")
+
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from the file.")
+            
+        return {
+            "filename": file.filename,
+            "text_preview": text[:300]
+        }
+    except Exception as e:
+        logger.exception("Error during file analysis: %s", e)
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
 
 @app.post("/process")
 async def process(req: ProcessRequest):
@@ -247,6 +250,11 @@ async def process(req: ProcessRequest):
     b, ctype = await download_bytes(url)
     text = extract_text_from_bytes(b, ctype)
     chunks = chunk_text(text, max_chars=3000)
+    
+    # Handle empty text case
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No extractable text found at the provided URL.")
+
     embeddings = openai_embed_texts(chunks)
     if embeddings and USE_PINECONE:
         upsert_to_pinecone(policy_id, chunks, embeddings)
@@ -262,10 +270,15 @@ async def ask(req: AskRequest):
     meta = load_policy_meta(req.policy_id)
     if not meta:
         raise HTTPException(status_code=404, detail="policy_id not found; call /process first")
+    
     question = req.question.strip()
-    q_emb = openai.Embedding.create(model=EMBED_MODEL, input=[question])["data"][0]["embedding"]
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    
+    q_emb = openai.embeddings.create(model=EMBED_MODEL, input=[question]).data[0].embedding
+    
     retrieved_texts: List[str] = []
-    if q_emb and USE_PINECONE:
+    if USE_PINECONE:
         matches = pinecone_index.query(vector=q_emb, top_k=3, filter={"policy_id": {"$eq": req.policy_id}}, include_metadata=True)
         for m in matches.get("matches", []):
             retrieved_texts.append(m.get("metadata", {}).get("text_preview", ""))
@@ -278,11 +291,20 @@ async def ask(req: AskRequest):
         D, I = idx.search(qv.reshape(1, -1), 3)
         for idx_pos in I[0].tolist():
             retrieved_texts.append(chunks[idx_pos])
-    prompt = "Answer this question using context:\n\n" + "\n\n".join(retrieved_texts)
-    llm_out = openai.ChatCompletion.create(
+            
+    if not retrieved_texts:
+        return {"policy_id": req.policy_id, "question": question, "answer": "I could not find any relevant information in the policy to answer your question."}
+    
+    prompt = f"Using only the following context, answer the user's question. If the information isn't available in the context, say you can't answer.\n\nContext:\n{'\n\n'.join(retrieved_texts)}\n\nQuestion:\n{question}"
+    
+    llm_out = openai.chat.completions.create(
         model=LLM_MODEL,
-        messages=[{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
         max_tokens=600,
         temperature=0
     ).choices[0].message.content
+    
     return {"policy_id": req.policy_id, "question": question, "answer": llm_out}
