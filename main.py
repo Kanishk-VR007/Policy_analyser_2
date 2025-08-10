@@ -10,10 +10,12 @@ from sentence_transformers import SentenceTransformer
 # Create FastAPI instance
 app = FastAPI()
 
+# Health check route for Railway
 @app.get("/")
 async def root():
-    return {"message": "Policy Analyzer is running!"}
+    return {"message": "Policy Analyzer is running on Railway!"}
 
+# File upload and analysis endpoint
 @app.post("/analyze")
 async def analyze_policy(file: UploadFile = File(...)):
     # Read file
@@ -32,11 +34,14 @@ async def analyze_policy(file: UploadFile = File(...)):
     else:
         return {"error": "Unsupported file format"}
 
-    # TODO: Replace with your actual policy analysis logic
-    return {"filename": file.filename, "text_preview": text[:300]}
+    # Placeholder for your actual policy analysis logic
+    # You can add OpenAI API calls, FAISS vector search, etc. here
+    return {
+        "filename": file.filename,
+        "text_preview": text[:300]  # Show first 300 chars
+    }
 
+# Entry point for local development
 if __name__ == "__main__":
-    # Local run only — Railway will use Procfile
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
